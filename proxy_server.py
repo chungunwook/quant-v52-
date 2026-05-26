@@ -16,7 +16,7 @@
 ═══════════════════════════════════════════════════════════════════════
 """
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, redirect, make_response, render_template_string
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
@@ -24,15 +24,202 @@ import re
 import time
 import os
 import json
+import secrets
+import hashlib
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__, static_folder='.')
 CORS(app)
 
 # 실전 기록장 저장 경로 (스크립트와 같은 폴더)
-JOURNAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal.json")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+JOURNAL_PATH = os.path.join(SCRIPT_DIR, "journal.json")
+CONFIG_PATH  = os.path.join(SCRIPT_DIR, "config.json")
 _journal_lock = threading.Lock()
+
+# ───────────────────────────────────────────────────────────────────────
+#  접속 비밀번호 (선택 기능)
+# ───────────────────────────────────────────────────────────────────────
+#  ENABLE_PIN_AUTH=True 일 때만 PIN 인증 활성화. 기본은 꺼짐.
+#  - 켜기:  Render 환경변수에 ENABLE_PIN_AUTH=1 추가, 또는 아래 값을 True 로
+#  - 활성화 시: 최초 실행 때 4자리 PIN 자동 생성하여 콘솔/로그에 출력
+#  - 활성화 시: 폰에서 처음 접속하면 PIN 입력, 한 번 입력 후 30일 자동 로그인
+# ───────────────────────────────────────────────────────────────────────
+ENABLE_PIN_AUTH = os.environ.get("ENABLE_PIN_AUTH", "").lower() in ("1","true","yes","on")
+ALLOW_LOCAL_NO_AUTH = True   # PC 본인(localhost) 접속은 비번 없이 허용
+
+def _load_config():
+    if not os.path.exists(CONFIG_PATH):
+        # 최초 실행 — 4자리 PIN 자동 생성
+        pin = str(secrets.randbelow(10000)).zfill(4)
+        cfg = {"access_pin": pin, "session_tokens": []}
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        print("\n" + "=" * 65)
+        print(f"  🔐 외부 접속 PIN 생성됨:  {pin}")
+        print(f"  (config.json 에 저장. 폰에서 처음 접속 시 입력)")
+        print("=" * 65 + "\n")
+        return cfg
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"access_pin": "0000", "session_tokens": []}
+
+def _save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+_config_lock = threading.Lock()
+
+def _issue_token():
+    """30일 유효 세션 토큰 발급"""
+    with _config_lock:
+        cfg = _load_config()
+        token = secrets.token_urlsafe(24)
+        expires = (datetime.now() + timedelta(days=30)).isoformat()
+        if "session_tokens" not in cfg:
+            cfg["session_tokens"] = []
+        cfg["session_tokens"].append({"token": token, "expires": expires})
+        # 만료된 토큰 정리
+        now = datetime.now()
+        cfg["session_tokens"] = [
+            t for t in cfg["session_tokens"]
+            if datetime.fromisoformat(t["expires"]) > now
+        ]
+        _save_config(cfg)
+    return token
+
+def _is_authenticated():
+    """현재 요청이 인증되었는지 검사"""
+    # PIN 인증이 꺼져 있으면 항상 통과
+    if not ENABLE_PIN_AUTH:
+        return True
+    # 로컬 접속은 통과 (PC 본인)
+    if ALLOW_LOCAL_NO_AUTH:
+        remote = request.remote_addr or ""
+        if remote.startswith("127.") or remote == "::1" or remote == "localhost":
+            return True
+    # 세션 토큰 검사
+    token = request.cookies.get("session") or request.headers.get("X-Session")
+    if not token:
+        return False
+    cfg = _load_config()
+    now = datetime.now()
+    for t in cfg.get("session_tokens", []):
+        if t["token"] == token:
+            try:
+                if datetime.fromisoformat(t["expires"]) > now:
+                    return True
+            except Exception:
+                pass
+    return False
+
+# Flask 글로벌 인증 검사 (정적 + API)
+PUBLIC_PATHS = {"/login", "/api/login", "/health", "/favicon.ico"}
+
+@app.before_request
+def _check_auth():
+    path = request.path
+    if path in PUBLIC_PATHS:
+        return None
+    if _is_authenticated():
+        return None
+    # 정적 페이지 → 로그인 페이지로
+    if request.method == "GET" and (path == "/" or path.endswith(".html")):
+        return redirect("/login")
+    # API → 401
+    return jsonify({"ok": False, "error": "인증이 필요합니다.", "needLogin": True}), 401
+
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="ko"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>로그인 — V5.2</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#08090d;color:#e8eaf0;font-family:-apple-system,'Noto Sans KR',sans-serif;
+    min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .box{background:#141720;border:1px solid #1e2230;border-radius:16px;padding:32px;
+    max-width:360px;width:100%;text-align:center}
+  .icon{width:48px;height:48px;background:linear-gradient(135deg,#00e5ff,#0077ff);
+    border-radius:12px;display:inline-flex;align-items:center;justify-content:center;
+    font-size:22px;margin-bottom:16px;box-shadow:0 0 24px rgba(0,229,255,.35)}
+  h1{font-size:18px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:12px;color:#5a6070;margin-bottom:24px;line-height:1.5}
+  input{width:100%;background:#0f1117;border:1px solid #1e2230;border-radius:10px;
+    padding:14px;color:#e8eaf0;font-family:'JetBrains Mono',monospace;font-size:24px;
+    text-align:center;letter-spacing:8px;outline:none;margin-bottom:14px}
+  input:focus{border-color:#00e5ff;box-shadow:0 0 0 3px rgba(0,229,255,.1)}
+  button{width:100%;background:linear-gradient(135deg,#00e5ff,#0077ff);color:#000;
+    border:none;border-radius:10px;padding:13px;font-size:14px;font-weight:700;
+    cursor:pointer;font-family:'Noto Sans KR',sans-serif}
+  .err{color:#ff1744;font-size:12px;margin-top:10px;min-height:18px}
+  .hint{font-size:10px;color:#5a6070;margin-top:18px;line-height:1.6}
+</style></head><body>
+<div class="box">
+  <div class="icon">⚙️</div>
+  <h1>매일 투자 추천 V5.2</h1>
+  <div class="sub">PC에서 실행한 서버에 접속 중<br>4자리 PIN을 입력하세요</div>
+  <form id="loginForm" onsubmit="return doLogin(event)">
+    <input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="4"
+      placeholder="••••" autofocus autocomplete="off">
+    <button type="submit">로그인</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="hint">
+    PIN은 PC에서 처음 서버 실행 시 콘솔에 출력됩니다.<br>
+    또는 PC 폴더의 <strong>config.json</strong> 파일에서 확인.
+  </div>
+</div>
+<script>
+async function doLogin(e){
+  e.preventDefault();
+  const pin = document.getElementById('pin').value;
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pin})
+    });
+    const d = await r.json();
+    if (!d.ok) { err.textContent = d.error || 'PIN이 올바르지 않습니다.'; return false; }
+    location.href = '/';
+  } catch (ex) { err.textContent = '서버 오류'; }
+  return false;
+}
+</script>
+</body></html>"""
+
+@app.route("/login")
+def login_page():
+    return LOGIN_PAGE
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    try:
+        body = request.get_json() or {}
+        pin = str(body.get("pin", "")).strip()
+        cfg = _load_config()
+        if pin != cfg.get("access_pin"):
+            return jsonify({"ok": False, "error": "PIN이 올바르지 않습니다."}), 401
+        token = _issue_token()
+        resp = make_response(jsonify({"ok": True}))
+        # 30일짜리 HttpOnly 쿠키
+        resp.set_cookie("session", token, max_age=30*24*3600,
+                        httponly=True, samesite="Lax")
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie("session", "", max_age=0)
+    return resp
 
 # ───────────────────────────────────────────────────────────────────────
 #  설정
@@ -1500,6 +1687,318 @@ def journal_delete():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+# ───────────────────────────────────────────────────────────────────────
+#  백업 / 복원 — Render 무료 플랜 디스크 휘발성 대비
+# ───────────────────────────────────────────────────────────────────────
+#  사용 흐름:
+#    [백업]  GET  /api/journal/backup
+#            → journal.json 파일을 그대로 다운로드 (폰에 저장)
+#    [복원]  POST /api/journal/restore
+#            → 백업 파일을 업로드해 journal.json 통째로 교체
+#    Render 서비스가 재배포되어 데이터가 사라져도, 폰에 저장해둔 백업
+#    파일을 복원하면 그대로 되돌릴 수 있다.
+# ───────────────────────────────────────────────────────────────────────
+
+@app.route("/api/journal/backup", methods=["GET"])
+def journal_backup():
+    """기록장 전체를 JSON 파일로 다운로드"""
+    try:
+        with _journal_lock:
+            j = _load_journal()
+        # 다운로드 파일명에 날짜 포함
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"quant_journal_backup_{date_str}.json"
+        body = json.dumps(j, ensure_ascii=False, indent=2)
+        resp = make_response(body)
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="{filename}"'
+        )
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/journal/restore", methods=["POST"])
+def journal_restore():
+    """
+    백업 파일로 기록장 복원.
+    body: { data: {...} }  또는  multipart 파일 업로드
+    mode: 'replace' (전체 교체) | 'merge' (병합 — 기존+백업, 같은 날짜는 백업 우선)
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        backup_data = body.get("data")
+        mode = body.get("mode", "merge")  # 기본은 안전한 병합
+
+        if not backup_data or not isinstance(backup_data, dict):
+            return jsonify({"ok": False, "error": "유효한 백업 데이터가 없습니다."}), 400
+        if "entries" not in backup_data:
+            return jsonify({"ok": False, "error": "백업 파일 형식이 올바르지 않습니다 (entries 누락)."}), 400
+
+        backup_entries = backup_data.get("entries", {})
+        backup_seed = backup_data.get("seedMoney")
+
+        with _journal_lock:
+            current = _load_journal()
+            if mode == "replace":
+                # 전체 교체
+                current["entries"] = backup_entries
+                if backup_seed is not None:
+                    current["seedMoney"] = backup_seed
+                restored_count = len(backup_entries)
+                added_count = restored_count
+            else:
+                # 병합 (같은 날짜는 백업 우선, 기존 날짜는 유지)
+                if "entries" not in current:
+                    current["entries"] = {}
+                added_count = 0
+                overwritten_count = 0
+                for date, entry in backup_entries.items():
+                    if date in current["entries"]:
+                        overwritten_count += 1
+                    else:
+                        added_count += 1
+                    current["entries"][date] = entry
+                restored_count = added_count + overwritten_count
+                # 시드는 현재 값이 기본 100만원이면 백업값으로 갱신
+                if backup_seed is not None and current.get("seedMoney", 1_000_000) == 1_000_000:
+                    current["seedMoney"] = backup_seed
+            _save_journal(current)
+
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "restoredCount": restored_count,
+            "addedCount": added_count,
+            "totalEntries": len(current["entries"]),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/journal/clear", methods=["POST"])
+def journal_clear():
+    """기록장 전체 초기화 (확인 후 사용 — 위험)"""
+    try:
+        body = request.get_json() or {}
+        if body.get("confirm") != "DELETE-ALL":
+            return jsonify({"ok": False, "error": "확인 문구가 일치하지 않습니다."}), 400
+        with _journal_lock:
+            _save_journal({"seedMoney": 1_000_000, "entries": {}})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  자동 성과 확인 — 장 마감 후 일봉으로 자동 결과 산출
+# ───────────────────────────────────────────────────────────────────────
+#  사용 흐름:
+#    1) 사용자가 추천 카드에서 "오늘 추천 기록장에 저장" 클릭
+#    2) 장 마감 후 (오후 4시 이후) 기록장에서 "결과 자동 채우기" 클릭
+#    3) 서버가 그날 일봉을 받아 종목별로 익절/손절/시간청산/관망 자동 판정
+#
+#  판정 로직 (백테스트와 동일한 규칙):
+#    - 당일 고가 < Target           → 관망 (Target 미돌파)
+#    - 당일 고가 >= 익절가          → 익절 (청산가 = 익절가)
+#    - 당일 저가 <= 손절가          → 손절 (청산가 = 손절가)
+#    - 둘 다 닿음                   → 익절 우선 (낙관, 일봉 한계)
+#    - 둘 다 미도달, Target 돌파    → 시간청산 (청산가 = 종가)
+#
+#  ※ 일봉 한계: "익절가·손절가 둘 다 닿은 날"의 실제 순서는 알 수 없어
+#     낙관적으로 익절을 우선합니다. 실제 거래 결과와 다를 수 있음.
+#     정확하려면 분봉이 필요 (백테스트의 분봉 모드 참조).
+# ───────────────────────────────────────────────────────────────────────
+
+def _judge_result(ohlc, pick):
+    """일봉 OHLC와 추천 정보로 결과 판정"""
+    target = float(pick.get("buyTarget", 0))
+    tp     = float(pick.get("profitTarget", 0))
+    sl     = float(pick.get("stopPrice", 0))
+
+    high  = ohlc.get("high", 0)
+    low   = ohlc.get("low", 0)
+    close = ohlc.get("close", 0)
+
+    if not target or not high or not low:
+        return {"executed": False, "exitPrice": 0,
+                "reason": "데이터 없음", "netReturn": 0.0,
+                "ohlc": ohlc}
+
+    # 4단계: Target 돌파 여부
+    if high < target:
+        return {"executed": False, "exitPrice": 0,
+                "reason": "관망", "netReturn": 0.0, "ohlc": ohlc}
+
+    # 5단계: 익절/손절/시간청산
+    hit_tp = high >= tp
+    hit_sl = low  <= sl
+    if hit_tp:               # 익절 우선 (둘 다 닿음 포함)
+        exit_price, reason = tp, "익절"
+    elif hit_sl:
+        exit_price, reason = sl, "손절"
+    else:
+        exit_price, reason = close, "시간청산"
+
+    # 거래 비용 차감 순수익률
+    entry = target
+    buy_cost  = entry * (FEE_RATE + SLIPPAGE_RATE)
+    sell_cost = exit_price * (FEE_RATE + SLIPPAGE_RATE + TAX_RATE)
+    gross = (exit_price - entry) / entry
+    net = gross - (buy_cost + sell_cost) / entry
+
+    return {
+        "executed": True,
+        "exitPrice": round(exit_price),
+        "reason": reason,
+        "netReturn": round(net * 100, 2),
+        "ohlc": ohlc,
+    }
+
+
+@app.route("/api/journal/auto-fill-results", methods=["POST"])
+def journal_auto_fill_results():
+    """
+    특정 날짜의 추천 종목들에 대해 결과를 자동으로 채움.
+    body: { date, overwrite?:bool }   date 미지정 시 가장 최근 미입력 날짜
+
+    반환: 각 종목별 판정 결과 + 그날 50:50 평균 수익률
+    """
+    try:
+        body = request.get_json() or {}
+        target_date = body.get("date")
+        overwrite = bool(body.get("overwrite", False))
+
+        with _journal_lock:
+            j = _load_journal()
+
+        if target_date:
+            if target_date not in j["entries"]:
+                return jsonify({"ok": False,
+                    "error": f"{target_date} 추천 기록이 없습니다."}), 404
+            dates = [target_date]
+        else:
+            # 결과 미입력 종목이 있는 모든 날짜
+            dates = []
+            for d in sorted(j["entries"].keys()):
+                picks = j["entries"][d].get("picks", [])
+                if any(p.get("result") is None for p in picks):
+                    dates.append(d)
+            if not dates:
+                return jsonify({"ok": True, "message": "이미 모든 결과가 입력되어 있습니다.",
+                                "filled": []})
+
+        # 오늘 날짜인 경우 장 마감 시간 체크 (한국 시간 기준)
+        # 서버 시간이 UTC일 수 있어 +9 보정
+        from datetime import timezone
+        kst = timezone(timedelta(hours=9))
+        kst_now = datetime.now(kst)
+        today_kst = kst_now.strftime("%Y-%m-%d")
+        market_closed = kst_now.hour >= 16  # 16:00 KST 이후
+
+        results = []
+        for d in dates:
+            picks = j["entries"][d].get("picks", [])
+
+            # 오늘 날짜인데 아직 장 마감 전이면 경고
+            if d == today_kst and not market_closed:
+                results.append({
+                    "date": d,
+                    "warning": "오늘 장 마감 전입니다. 정확한 결과는 16:00 이후 확인 가능합니다.",
+                    "picks": [],
+                })
+                continue
+
+            day_results = []
+            for p in picks:
+                # 이미 결과 있고 overwrite=False면 건너뜀
+                if p.get("result") is not None and not overwrite:
+                    day_results.append({
+                        "code": p["code"], "name": p["name"],
+                        "skipped": True, "reason": "이미 입력됨",
+                        "result": p["result"],
+                    })
+                    continue
+
+                # 네이버에서 해당일 OHLC 조회
+                try:
+                    # 일별 시세에서 해당 날짜 찾기
+                    history = fetch_naver_daily_history(p["code"], pages=3)
+                    target_ohlc = None
+                    for bar in history:
+                        if bar["date"] == d:
+                            target_ohlc = bar
+                            break
+                    if not target_ohlc:
+                        day_results.append({
+                            "code": p["code"], "name": p["name"],
+                            "skipped": True,
+                            "reason": f"{d} 일봉 데이터를 찾을 수 없음 (휴장일?)",
+                        })
+                        continue
+
+                    result = _judge_result(target_ohlc, p)
+                    day_results.append({
+                        "code": p["code"], "name": p["name"],
+                        "skipped": False, **result,
+                    })
+                except Exception as e:
+                    day_results.append({
+                        "code": p["code"], "name": p["name"],
+                        "skipped": True, "reason": f"조회 오류: {e}",
+                    })
+
+                time.sleep(0.15)  # 네이버 부하 방지
+
+            # 그날 50:50 평균 수익률 계산
+            valid_returns = [r["netReturn"] for r in day_results
+                             if "netReturn" in r and not r.get("skipped")]
+            day_avg = (sum(valid_returns) / len(picks)) if picks else 0.0
+
+            results.append({
+                "date": d, "picks": day_results,
+                "dailyReturn": round(day_avg, 2),
+            })
+
+            # 결과를 journal에 저장
+            with _journal_lock:
+                j = _load_journal()
+                for r in day_results:
+                    if r.get("skipped"): continue
+                    for p in j["entries"][d]["picks"]:
+                        if p["code"] == r["code"]:
+                            p["result"] = {
+                                "executed": r["executed"],
+                                "exitPrice": r["exitPrice"],
+                                "reason": r["reason"],
+                                "netReturn": r["netReturn"],
+                                "autoFilled": True,
+                            }
+                            break
+                _save_journal(j)
+
+        return jsonify({"ok": True, "filled": results,
+                        "totalDates": len(results)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/journal/auto-fill-today", methods=["POST"])
+def journal_auto_fill_today():
+    """오늘 추천에 대해서만 자동 채움 (편의 엔드포인트)"""
+    from datetime import timezone
+    kst = timezone(timedelta(hours=9))
+    today = datetime.now(kst).strftime("%Y-%m-%d")
+    # 내부적으로 auto-fill-results 와 같은 로직 호출
+    with app.test_request_context(json={"date": today}):
+        return journal_auto_fill_results()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  정적 파일 서빙 (대시보드 HTML)
 # ═══════════════════════════════════════════════════════════════════════
@@ -1530,7 +2029,12 @@ if __name__ == "__main__":
     print("=" * 65)
     print(f"  대시보드:   http://localhost:{port}")
     print(f"  헬스체크:   http://localhost:{port}/health")
+    if ENABLE_PIN_AUTH:
+        # _load_config() 호출되며 최초 PIN 자동 생성·출력
+        _load_config()
+    else:
+        print("  🔓 PIN 인증 OFF (환경변수 ENABLE_PIN_AUTH=1 로 활성화 가능)")
     print("-" * 65)
     print("  ※ dashboard.html 파일을 이 스크립트와 같은 폴더에 두세요.")
     print("=" * 65)
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
