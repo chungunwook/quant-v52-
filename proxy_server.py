@@ -325,8 +325,10 @@ def fetch_naver_ohlc(stock_code):
     # 종목 기본 정보 (현재가, 종목명)
     url_main = f"https://finance.naver.com/item/main.naver?code={stock_code}"
     res = requests.get(url_main, headers=NAVER_HEADERS, timeout=8)
-    res.encoding = "euc-kr"
-    soup = BeautifulSoup(res.text, "lxml")
+    # 네이버 금융은 EUC-KR. requests 자동감지가 환경에 따라 잘못될 수 있어
+    # content를 직접 디코딩 (errors='replace'로 깨진 바이트는 안전 치환)
+    html_text = res.content.decode("euc-kr", errors="replace")
+    soup = BeautifulSoup(html_text, "html.parser")
 
     # 종목명
     name_tag = soup.select_one(".wrap_company h2 a")
@@ -365,8 +367,8 @@ def fetch_naver_ohlc(stock_code):
     try:
         url_day = f"https://finance.naver.com/item/sise_day.naver?code={stock_code}&page=1"
         res2 = requests.get(url_day, headers=NAVER_HEADERS, timeout=8)
-        res2.encoding = "euc-kr"
-        soup2 = BeautifulSoup(res2.text, "lxml")
+        html_text2 = res2.content.decode("euc-kr", errors="replace")
+        soup2 = BeautifulSoup(html_text2, "html.parser")
         rows = soup2.select("table.type2 tr")
 
         day_rows = []
@@ -467,8 +469,8 @@ def fetch_naver_top_amount(market="KOSDAQ", count=30):
     sosok = "0" if market == "KOSPI" else "1"
     url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}"
     res = requests.get(url, headers=NAVER_HEADERS, timeout=8)
-    res.encoding = "euc-kr"
-    soup = BeautifulSoup(res.text, "lxml")
+    html_text = res.content.decode("euc-kr", errors="replace")
+    soup = BeautifulSoup(html_text, "html.parser")
 
     stocks = []
     rows = soup.select("table.type_2 tr")
@@ -541,17 +543,20 @@ def run_v52_pipeline(params):
     noise_threshold = float(params.get("noiseThreshold", 0.45))
     target_return = float(params.get("targetReturn", 3)) / 100
     stop_loss = float(params.get("stopLoss", 1.5)) / 100
-    count = int(params.get("count", 25))
+    # 메모리 한도 (Render 무료 512MB) 보호 — 25개 → 12개 기본, 최대 20개
+    count = min(int(params.get("count", 12)), 20)
 
     # ── 1단계 + 2단계: 데이터 수집 & 주도 테마 필터링 ──
     candidates = fetch_naver_top_amount(market, count)
 
+    import gc
     analyzed = []
     for cand in candidates:
         try:
             ohlc = fetch_naver_ohlc(cand["code"])
             time.sleep(0.15)
         except Exception:
+            gc.collect()  # 예외 시 누수 방지
             continue
 
         o, h, l, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
@@ -659,8 +664,8 @@ def fetch_naver_daily_history(stock_code, pages=20):
                f"?code={stock_code}&page={page}")
         try:
             res = requests.get(url, headers=NAVER_HEADERS, timeout=8)
-            res.encoding = "euc-kr"
-            soup = BeautifulSoup(res.text, "lxml")
+            html_text = res.content.decode("euc-kr", errors="replace")
+            soup = BeautifulSoup(html_text, "html.parser")
             page_rows = soup.select("table.type2 tr")
             got = 0
             for row in page_rows:
